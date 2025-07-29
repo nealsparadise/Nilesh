@@ -1,0 +1,270 @@
+code to call python from peoplesoft
+--------------------------------------------------
+/*================================================================
+ * FieldChange PeopleCode for the "Scan Project" button
+ * This code calls an external Python script to scan PeopleCode
+ * and displays the results in a grid.
+ ================================================================*/
+
+Function ParseAndDisplayResults(&jsonString As string)
+   /* Get the rowset for the results grid */
+   Local Rowset &rsGrid = GetLevel0()(1).GetRowset(Scroll.MY_PY_WORK);
+   &rsGrid.Flush(); /* Clear any previous results */
+   
+   /* Use the delivered JsonParser Application Class to handle the response */
+   Local PT_UTILS:JsonParser &oJsonParser = create PT_UTILS:JsonParser();
+   If Not &oJsonParser.Parse(&jsonString) Then
+      MessageBox(0, "", 0, 0, "Failed to parse JSON response from Python script. The script may have produced an error.");
+      Return;
+   End-If;
+   
+   /* The root of our JSON is an array of findings */
+   Local array &resultsArray = &oJsonParser.GetRootNode().GetArray();
+   
+   If &resultsArray.Len = 0 Then
+      MessageBox(0, "", 0, 0, "Scan completed with no findings.");
+      Return;
+   End-If;
+   
+   /* Loop through each finding in the JSON array */
+   For &i = 1 To &resultsArray.Len
+      Local PT_UTILS:JsonObject &finding = &resultsArray.Get(&i).GetObject();
+     
+      /* Check for an error message from the script itself (e.g., DB connection failed) */
+      If &finding.HasProperty("status") And &finding.GetProperty("status").GetStringValue() = "error" Then
+         MessageBox(0, "", 0, 0, "Error from script: " | &finding.GetProperty("message").GetStringValue());
+         Break; /* Stop processing if an error is reported */
+      End-If;
+     
+      /* Insert a new row in the grid and populate it */
+      &rsGrid.InsertRow(&rsGrid.ActiveRowCount);
+      Local Record &recWork = &rsGrid.GetRow(&rsGrid.ActiveRowCount).GetRecord(Record.MY_PY_WORK);
+     
+      &recWork.OBJECT_INFO.Value = &finding.GetProperty("object_info").GetStringValue();
+      &recWork.LINE_NBR.Value = &finding.GetProperty("line").GetNumberValue();
+      &recWork.RULE_ID.Value = &finding.GetProperty("rule_id").GetStringValue();
+      &recWork.ERROR_DESCR.Value = &finding.GetProperty("description").GetStringValue();
+      &recWork.CODE_SNIPPET.Value = &finding.GetProperty("code_snippet").GetStringValue();
+   End-For;
+   
+End-Function;
+
+
+/* --- Main Logic --- */
+Local string &sProjectName, &sPythonExecutable, &sPythonScriptPath, &sRulesPath, &sDbUser, &sDbPass, &sDbConnect, &sCmd;
+Local string &sJsonOutput;
+Local integer &nExitCode;
+
+/* --- Configuration Section --- */
+/* For better security and maintenance, these values should be stored in a secure configuration table or PeopleSoft Vault. */
+/* Do NOT hardcode passwords in production code. This is for demonstration purposes only. */
+&sPythonExecutable = "python"; /* or "python3" depending on your server setup */
+&sPythonScriptPath = "/opt/app/psoft/scripts/code_scanner.py"; /* Absolute path to the Python script on the App Server */
+&sRulesPath = "/opt/app/psoft/scripts/rules.json"; /* Absolute path to the rules file */
+&sDbUser = "PPLSOFT";
+&sDbPass = "mypassword"; /* !! VERY INSECURE - FOR DEMO ONLY !! */
+&sDbConnect = "dbhost:1521/ORCL"; /* Your TNS Name or database connect string */
+
+
+/* Get project name from the run control record on the page */
+&sProjectName = GetLevel0()(1).GetRecord(Record.MY_PC_SCAN_RC).PROJECTNAME.Value;
+
+If None(&sProjectName) Then
+   MessageBox(0, "", 0, 0, "Please select a project name before scanning.");
+   Exit;
+End-If;
+
+/* Construct the full command to be executed on the application server */
+&sCmd = &sPythonExecutable | " " | &sPythonScriptPath | " " | Quote(&sProjectName) | " " | &sRulesPath | " " | &sDbUser | " " | &sDbPass | " " | &sDbConnect;
+
+/* Execute the command synchronously. The PeopleCode will wait for the script to finish. */
+/* %Exec_Synchronous is key. %FilePath_Absolute tells PeopleSoft the path is not relative. */
+&nExitCode = Exec(&sCmd, %Exec_Synchronous + %FilePath_Absolute, &sJsonOutput);
+
+If &nExitCode = 0 Then
+   /* Success (Exit Code 0). The output from the script's 'print' statement is now in &sJsonOutput */
+   If All(&sJsonOutput) Then
+      ParseAndDisplayResults(&sJsonOutput);
+   Else
+      MessageBox(0, "", 0, 0, "Scan completed successfully, but the script returned no output.");
+      GetLevel0()(1).GetRowset(Scroll.MY_PY_WORK).Flush(); /* Clear grid */
+   End-If;
+Else
+   /* The script returned a non-zero exit code, indicating an error */
+   MessageBox(0, "", 0, 0, "Error executing Python script. Exit Code: " | &nExitCode | ". See script output below:" | Char(10) | &sJsonOutput);
+End-If;
+---------------------------------------------------------------------------------------------------------------------
+Code to scan peoplecode
+---------------------------------------------------------------------------------------------------------------------
+# code_scanner.py
+#
+# Description:
+# Connects to a PeopleSoft database, scans PeopleCode for a given project
+# based on rules defined in a JSON file, and prints findings to standard output.
+#
+# Arguments:
+# 1: Project Name
+# 2: Path to rules.json file
+# 3: Database User
+# 4: Database Password
+# 5: Database Connection String (e.g., 'your_host:1521/your_service' for Oracle)
+#
+# Example Usage:
+# python code_scanner.py MY_PROJECT /opt/app/psoft/scripts/rules.json PPLSOFT mypassword dbhost:1521/ORCL
+
+import sys
+import json
+import re
+import cx_Oracle # Use 'pyodbc' for SQL Server, and adjust connection logic
+
+def get_db_connection(user, password, connect_string):
+    """Establishes and returns a database connection."""
+    try:
+        # For Oracle DB. For SQL Server, the connection string and method will differ.
+        connection = cx_Oracle.connect(user, password, connect_string, encoding="UTF-8")
+        return connection
+    except Exception as e:
+        error_result = {
+            "status": "error",
+            "message": f"DB Connection Failed: {str(e)}"
+        }
+        print(json.dumps([error_result]))
+        sys.exit(1)
+
+def load_rules(rules_filepath):
+    """Loads scanning rules from a JSON file."""
+    try:
+        with open(rules_filepath, 'r') as f:
+            rules = json.load(f)
+        return rules
+    except FileNotFoundError:
+        error_result = { "status": "error", "message": f"Rules file not found at: {rules_filepath}" }
+        print(json.dumps([error_result]))
+        sys.exit(1)
+    except json.JSONDecodeError:
+        error_result = { "status": "error", "message": f"Invalid JSON in rules file: {rules_filepath}" }
+        print(json.dumps([error_result]))
+        sys.exit(1)
+
+def get_code_from_project(connection, project_name):
+    """Fetches all PeopleCode programs for a given project."""
+    sql = """
+        SELECT B.OBJECTTYPE, B.OBJECTID1, B.OBJECTID2, B.OBJECTID3, B.OBJECTID4, B.PROGTEXT
+        FROM PSPROJECTITEM A, PSPCMPROG B
+        WHERE A.PROJECTNAME = :project_name
+          AND A.OBJECTTYPE = 29 -- Object Type for PeopleCode
+          AND B.OBJECTTYPE = A.OBJECTVALUE1
+          AND B.OBJECTID1 = A.OBJECTVALUE2
+          AND B.OBJECTID2 = A.OBJECTVALUE3
+          AND B.OBJECTID3 = A.OBJECTVALUE4
+        ORDER BY B.OBJECTTYPE, B.OBJECTID1, B.OBJECTID2, B.OBJECTID3
+    """
+    cursor = connection.cursor()
+    cursor.execute(sql, project_name=project_name)
+    return cursor.fetchall()
+
+def scan_code(code_text, object_info, rules):
+    """Applies a set of rules from the loaded JSON to a block of PeopleCode."""
+    findings = []
+    lines = code_text.splitlines()
+
+    for i, line in enumerate(lines):
+        line_num = i + 1
+        clean_line = line.strip()
+
+        # Skip commented lines to reduce false positives
+        if clean_line.startswith(('REM', '/*')) or clean_line.startswith('*'):
+            continue
+
+        # Apply each rule to the current line
+        for rule in rules:
+            # The (?i) prefix in a regex pattern makes it case-insensitive
+            if re.search(rule['pattern'], line):
+                findings.append({
+                    "object_info": object_info,
+                    "line": line_num,
+                    "rule_id": rule['rule_id'],
+                    "description": rule['description'],
+                    "code_snippet": clean_line
+                })
+    return findings
+
+def main():
+    """Main execution function."""
+    if len(sys.argv) < 6:
+        error_result = {
+            "status": "error",
+            "message": "Invalid arguments. Usage: script.py <project> <rules_file> <user> <pass> <connect_string>"
+        }
+        print(json.dumps([error_result]))
+        sys.exit(1)
+
+    project_name = sys.argv[1]
+    rules_filepath = sys.argv[2]
+    db_user = sys.argv[3]
+    db_pass = sys.argv[4]
+    db_connect = sys.argv[5]
+
+    rules = load_rules(rules_filepath)
+    conn = get_db_connection(db_user, db_pass, db_connect)
+    code_list = get_code_from_project(conn, project_name)
+
+    all_findings = []
+    for row in code_list:
+        obj_type, obj_id1, obj_id2, obj_id3, obj_id4, prog_text_clob = row
+        
+        # Construct a human-readable object name for display
+        object_name = f"Type: {obj_type}, {obj_id1}, {obj_id2}, {obj_id3}"
+        
+        if prog_text_clob:
+            code_text = prog_text_clob.read()
+            findings = scan_code(code_text, object_name, rules)
+            all_findings.extend(findings)
+
+    conn.close()
+    
+    # Print the final list of findings as a JSON string to standard output
+    print(json.dumps(all_findings, indent=4))
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+--------------------------------------------------------------------------------------------------------------------------
+json rule
+--------------------------------------------------------------------------------------------------------------------------
+[
+  {
+    "rule_id": "EXIT1",
+    "description": "Potentially harmful Exit(1) found. This can terminate the entire process.",
+    "pattern": "Exit\\(1\\)"
+  },
+  {
+    "rule_id": "HARDCODE_URL",
+    "description": "Hardcoded URL found. Consider using the URL Maintenance table.",
+    "pattern": "https?://"
+  },
+  {
+    "rule_id": "SQLEXEC_IN_LOOP",
+    "description": "A loop keyword was found near a SQLExec. Please verify manually that SQLExec is not inside the loop.",
+    "pattern": "(?i)(for|while)[^;]+(sqlexec)"
+  },
+  {
+    "rule_id": "DEPRECATED_GETNEXT",
+    "description": "Deprecated 'GetNext' function found. Consider using a Rowset-based loop or a SQL object.",
+    "pattern": "(?i)GetNext\\("
+  },
+  {
+    "rule_id": "HARDCODED_CONNECT_INFO",
+    "description": "Hardcoded database connection details found.",
+    "pattern": "(?i)(dbuser|dbpass|connectid|connectpassword)"
+  },
+  {
+    "rule_id": "MESSAGEBOX_IN_AE",
+    "description": "MessageBox found in App Engine PeopleCode. This will pause the process and require manual intervention.",
+    "pattern": "(?i)MessageBox\\(0"
+  }
+]
